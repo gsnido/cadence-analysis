@@ -13,7 +13,7 @@ in a track field, but probably a treadmill would have been much better,
 especially when it comes to holding a constant speed at changing cadences.
 
 The cadence in each segment is dictated by a metronome (file
-`randomized_cadence_26_minutes.wav`), which I started exactly after the 10
+[`randomized_cadence_26_minutes.mp3`](randomized_cadence_26_minutes.mp3)), which I started exactly after the 10
 minutes warmup. Cadences are sampled between 185 and 210 per minute because I
 think this covers what I think it will be most efficient for me, based on
 previous threshold runs. I recorded the whole workout with a Garmin watch,
@@ -21,7 +21,7 @@ which produced a `.fit` file containing timestamped speed, heart-rate, and
 power records. I used a HR strap to get a more reliable heart-rate signal. This
 is how my workout looks like:
 
-![Workout](figs/screenshot_gc.png){width=80%}
+![Workout](figs/screenshot_gc.png){width=100%}
 
 
 
@@ -41,9 +41,9 @@ is how my workout looks like:
 - Every integer cadence from 185 through 210 beats/min appears once.
 - One metronome click corresponds to one step, counting both feet.
 
-The prescribed cadence order is specified in the `cadence_schedule.csv` file,
-which contains Minute, Start, End, and BPM columns. These are the first lines
-of the file:
+The prescribed cadence order is specified in the
+[`cadence_schedule.csv`](cadence_schedule.csv) file, which contains Minute,
+Start, End, and BPM columns. These are the first lines of the file:
 
 ```text
 Minute,Start,End,BPM
@@ -71,7 +71,7 @@ cadence change and small lags when starting the metronome.
 
 
 
-## Usage
+## Usage of `summarize_cadence_test.py`
 
 Default: first metronome click occurs 600 seconds after the recorded session
 start.
@@ -79,10 +79,10 @@ start.
 ```bash
 python summarize_cadence_test.py 25030325796_ACTIVITY.fit -o cadence_summary.csv
 ```
-The script will use the `cadence_scheduce.csv` by default, in the same
-directory as the script. If you want to use a different cadence schedule, you
-can specify it with the `--cadence-schedule` option. The file needs to have a
-header with a column called "BPM".
+The script will use the [`cadence_scheduce.csv`](cadence_schedule.csv) by
+default, in the same directory as the script. If you want to use a different
+cadence schedule, you can specify it with the `--cadence-schedule` option. The
+file needs to have a header with a column called "BPM".
 
 Custom offset: use the `--tempo-start` option.
 
@@ -95,7 +95,7 @@ python summarize_cadence_test.py --help
 
 ## Output
 
-The CSV contains 26 rows and these columns, in this order:
+The [output CSV](cadence_summary.csv) contains 26 rows and these columns, in this order:
 
 | Column | Description | Unit |
 |---|---|---|
@@ -134,9 +134,11 @@ With the default offset:
 
 ## The analysis
 
-The file `cadence_hr_analysis.qmd` contains a Quarto document that reads the
-CSV output (`cadence_summary.csv`) and carries out an analysis of the relationship between
-cadence and heart rate. It contains a lot of info and should be compiled to generate an html file:
+The file [`cadence_hr_analysis.qmd`](cadence_hr_analysis.qmd) contains a Quarto
+document that reads the CSV output
+([`cadence_summary.csv`](cadence_summary.csv) and carries out an analysis of
+the relationship between cadence and heart rate. It contains a lot of info and
+should be compiled to generate an [output html file](cadence_hr_analysis.html):
 
 ```bash
 quarto render cadence_hr_analysis.qmd -P data_file:cadence_summary.csv
