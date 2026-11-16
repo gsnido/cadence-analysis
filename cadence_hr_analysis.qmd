@@ -1,0 +1,822 @@
+---
+title: "Cadence and heart rate at threshold pace"
+subtitle: "A 26-minute randomised-cadence track session"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+params:
+  data_file: "cadence_summary.csv"
+  cadence_column: "cadence_bpm"
+  cadence_label: "Target cadence (steps/min)"
+---
+
+# Overview
+
+The question behind this analysis is whether there is a cadence at which heart
+rate (HR) is lowest when running at a fixed threshold pace. If there is, it
+would be a practical, individual estimate of the most economical cadence.
+
+No app or web service I could verify works out an individual, metabolically
+optimal cadence from ordinary Garmin or Strava uploads. That is because speed,
+terrain, fatigue and cadence all change together during normal runs. So the
+question was tested directly, with a structured session:
+
+* **Warm-up:** 10 minutes. The watch was paused for a couple of minutes during
+  the warm-up.
+* **Test block:** 26 consecutive one-minute segments at a target pace of
+  **3:55 min/km**, about 4.26 m/s, on a track.
+* **Cadence protocol:** a metronome WAV track. Every integer cadence from
+  **185 to 210 steps/min** was played once, for one minute, in random order.
+  Each click is one step, counting both feet.
+
+```{r}
+#| label: protocol
+#| code-fold: true
+cadence_sequence <- c(
+    193, 203, 197, 188, 187, 207,
+    190, 189, 205, 196, 186, 202,
+    206, 210, 194, 191, 185, 209,
+    199, 208, 204, 198, 195, 192,
+    200, 201
+)
+stopifnot(setequal(cadence_sequence, 185:210),
+          !anyDuplicated(cadence_sequence))
+```
+
+## Data extraction
+
+The segment summaries came from the Garmin FIT file, using the Python script
+`summarize_cadence_test.py`:
+
+1. **Timing.** Time was measured as active timer time, rebuilt from the FIT
+   timer start/stop events. This removes the pause during the warm-up. Lap
+   boundaries were ignored, because Auto Lap splits the test block into
+   several laps. The first metronome click is at timer time 600 s, set with
+   `--tempo-start`.
+2. **Windows.** For each one-minute segment, the first 20 s were dropped to
+   let HR adjust to the transition, and the last 5 s were dropped. That leaves
+   a 35-second window, from second 20 up to (but not including) second 55.
+3. **Summaries.** For each window, the script records mean speed (converted to
+   pace), mean HR and mean power.
+
+This assumes the watch timer and the metronome both ran continuously through
+the 26-minute block.
+
+The resulting CSV is the input to this document:
+
+| Column | Meaning |
+|---|---|
+| `segment` | Chronological segment number (1–26) |
+| `cadence_bpm` | Prescribed metronome cadence (steps/min) |
+| `pace_min_per_km` | Mean pace in the 35-s window (decimal min/km) |
+| `heart_rate_bpm` | Mean HR in the 35-s window |
+| `power_w` | Mean running power in the 35-s window |
+
+::: {.callout-note}
+`cadence_bpm` is the **prescribed** cadence, not the measured one. If measured
+cadence is added to the CSV, set the `cadence_column` and `cadence_label`
+parameters to use it instead.
+:::
+
+# Setup
+
+```{r}
+#| label: setup
+library(minpack.lm)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+theme_set(theme_minimal(base_size = 12))
+
+model_colours <- c(
+    current_speed  = "#1b1b1b",
+    previous_speed = "#2c7fb8",
+    previous_hr    = "#d95f0e"
+)
+
+model_labels <- c(
+    current_speed  = "Current speed",
+    previous_speed = "Current + previous speed",
+    previous_hr    = "Current speed + previous HR"
+)
+```
+
+## Helper functions
+
+```{r}
+#| label: helpers
+
+# AIC with small-sample correction; K includes the residual variance.
+aicc <- function(model) {
+    ll <- logLik(model)
+    K  <- attr(ll, "df")
+    n  <- nobs(model)
+    if (n <= K + 1) return(Inf)
+    AIC(model) + 2 * K * (K + 1) / (n - K - 1)
+}
+
+# One-row-per-model comparison table.
+compare_models <- function(models, data) {
+    out <- do.call(rbind, lapply(names(models), function(name) {
+        m <- models[[name]]
+        r <- data$y - as.numeric(predict(m, newdata = data))
+        data.frame(
+            model         = name,
+            n             = nobs(m),
+            K             = attr(logLik(m), "df"),
+            RMSE_bpm      = sqrt(mean(r^2)),
+            residual_lag1 = cor(head(r, -1), tail(r, -1)),
+            AIC           = AIC(m),
+            AICc          = aicc(m),
+            converged     = isTRUE(m$convInfo$isConv)
+        )
+    }))
+    out$delta_AICc <- out$AICc - min(out$AICc)
+    out[order(out$AICc), ]
+}
+
+# Residual autocorrelations in long format, for ggplot.
+acf_table <- function(residuals, model, lag_max = 6) {
+    a <- acf(residuals, lag.max = lag_max, plot = FALSE)
+    data.frame(
+        model = model,
+        lag   = as.numeric(a$lag)[-1],
+        acf   = as.numeric(a$acf)[-1],
+        limit = qnorm(0.975) / sqrt(length(residuals))
+    )
+}
+
+# Residual time-pattern and ACF plots for a named list of models.
+plot_residual_diagnostics <- function(models, data, labels = names(models)) {
+    res <- bind_rows(lapply(names(models), function(name) {
+        data.frame(
+            model    = labels[[name]],
+            segment  = data$segment,
+            residual = data$y - as.numeric(predict(models[[name]], newdata = data))
+        )
+    }))
+    res$model <- factor(res$model, levels = unname(labels[names(models)]))
+
+    acfs <- bind_rows(lapply(split(res, res$model), function(d) {
+        acf_table(d$residual, unique(d$model))
+    }))
+    acfs$model <- factor(acfs$model, levels = levels(res$model))
+
+    p_time <- ggplot(res, aes(segment, residual)) +
+        geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+        geom_line(colour = "grey60") +
+        geom_point(size = 2) +
+        geom_smooth(method = "loess", formula = y ~ x, span = 0.75,
+                    se = FALSE, colour = "firebrick") +
+        facet_wrap(~ model, nrow = 1) +
+        labs(x = "Segment", y = "Residual HR (bpm)",
+             title = "Residuals over time")
+
+    p_acf <- ggplot(acfs, aes(lag, acf)) +
+        geom_hline(yintercept = 0, colour = "grey40") +
+        geom_hline(aes(yintercept = limit), linetype = 2, colour = "steelblue") +
+        geom_hline(aes(yintercept = -limit), linetype = 2, colour = "steelblue") +
+        geom_segment(aes(xend = lag, yend = 0), linewidth = 1.2) +
+        facet_wrap(~ model, nrow = 1) +
+        scale_x_continuous(breaks = 1:6) +
+        coord_cartesian(ylim = c(-1, 1)) +
+        labs(x = "Lag (segments)", y = "Autocorrelation",
+             title = "Residual autocorrelation")
+
+    list(time = p_time, acf = p_acf)
+}
+```
+
+# Data
+
+```{r}
+#| label: data
+raw <- read.csv(params$data_file)
+
+stopifnot(
+    all(c("segment", "pace_min_per_km", "heart_rate_bpm",
+          params$cadence_column) %in% names(raw))
+)
+
+dat <- raw |>
+    arrange(segment) |>
+    mutate(
+        x       = segment - 1,                       # minutes into the test, starting at 0
+        y       = heart_rate_bpm,
+        speed   = 1000 / (60 * pace_min_per_km),     # m/s
+        cadence = .data[[params$cadence_column]]
+    )
+
+stopifnot(
+    nrow(dat) == 26,
+    all(diff(dat$segment) == 1),
+    all(complete.cases(dat[, c("x", "y", "speed", "cadence")]))
+)
+
+dat |>
+    summarise(
+        segments      = n(),
+        mean_pace     = mean(pace_min_per_km),
+        sd_speed_m_s  = sd(speed),
+        mean_hr       = mean(y),
+        hr_range      = paste(round(range(y), 1), collapse = "–")
+    ) |>
+    knitr::kable(digits = 3)
+```
+
+```{r}
+#| label: fig-raw
+#| fig-cap: "Segment-level HR, speed and cadence in chronological order."
+#| fig-height: 6
+dat |>
+    transmute(segment,
+              `HR (bpm)` = y,
+              `Speed (m/s)` = speed,
+              `Cadence (steps/min)` = cadence) |>
+    pivot_longer(-segment) |>
+    ggplot(aes(segment, value)) +
+    geom_line(colour = "grey60") +
+    geom_point(size = 2) +
+    facet_wrap(~ name, ncol = 1, scales = "free_y") +
+    labs(x = "Segment", y = NULL)
+```
+
+# Background HR trend over time
+
+HR rises over the course of a sustained threshold effort, whatever the cadence.
+That trend has to be accounted for before cadence effects can be seen. Time is
+`x = segment - 1`, so the curve starts at zero.
+
+Two time models were compared on all 26 segments:
+
+* **Sloping asymptote.** An exponential approach to a line that keeps rising:
+  \[
+  HR(x) = a + bx - De^{-kx}
+  \]
+* **Horizontal asymptote.** An exponential approach to a plateau:
+  \[
+  HR(x) = H_{\text{start}} + (H_{\text{final}} - H_{\text{start}})\left(1 - e^{-kx}\right)
+  \]
+
+The horizontal model is the sloping model with $b = 0$, using
+$H_{\text{final}} = a$ and $H_{\text{start}} = a - D$. In this document,
+`final_hr` is the **asymptotic** HR, the plateau as time goes to infinity. It
+is not the predicted HR at minute 26. The rate parameter is held positive, so
+both curves approach their asymptote.
+
+```{r}
+#| label: time-models
+start_guess <- c(
+    start_hr    = mean(dat$y[1:2]),
+    final_hr    = mean(tail(dat$y, 5)),
+    growth_rate = 0.3
+)
+
+fit_time <- nlsLM(
+    y ~ start_hr + (final_hr - start_hr) * (1 - exp(-growth_rate * x)),
+    data    = dat,
+    start   = as.list(start_guess),
+    lower   = c(-Inf, -Inf, 1e-8),
+    control = nls.lm.control(maxiter = 1000)
+)
+
+p0 <- coef(fit_time)
+
+fit_time_sloped <- nlsLM(
+    y ~ (intercept_asymptote + slope_asymptote * x) -
+        initial_deviation * exp(-rate_of_approach * x),
+    data  = dat,
+    start = list(
+        intercept_asymptote = unname(p0["final_hr"]),
+        slope_asymptote     = 0,
+        initial_deviation   = unname(p0["final_hr"] - p0["start_hr"]),
+        rate_of_approach    = unname(p0["growth_rate"])
+    ),
+    lower   = c(-Inf, -Inf, -Inf, 1e-8),
+    control = nls.lm.control(maxiter = 1000)
+)
+
+time_models <- list(
+    horizontal_asymptote = fit_time,
+    sloping_asymptote    = fit_time_sloped
+)
+
+compare_models(time_models, dat) |> knitr::kable(digits = 3, row.names = FALSE)
+```
+
+```{r}
+#| label: fig-time-fits
+#| fig-cap: "Observed HR with both fitted time trends."
+grid_time <- data.frame(x = seq(min(dat$x), max(dat$x), length.out = 300))
+grid_time$segment <- grid_time$x + 1
+
+time_curves <- bind_rows(
+    data.frame(grid_time, model = "Horizontal asymptote",
+               hr = predict(fit_time, newdata = grid_time)),
+    data.frame(grid_time, model = "Sloping asymptote",
+               hr = predict(fit_time_sloped, newdata = grid_time))
+)
+
+ggplot(dat, aes(segment, y)) +
+    geom_point(size = 2) +
+    geom_line(data = time_curves, aes(y = hr, colour = model), linewidth = 1) +
+    scale_colour_manual(values = c("Horizontal asymptote" = "firebrick",
+                                   "Sloping asymptote" = "steelblue")) +
+    labs(x = "Segment", y = "HR (bpm)", colour = NULL) +
+    theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: fig-time-residuals
+#| fig-cap: "Residual time patterns and autocorrelation for the two time models."
+#| fig-height: 7
+diag_time <- plot_residual_diagnostics(
+    time_models, dat,
+    labels = c(horizontal_asymptote = "Horizontal asymptote",
+               sloping_asymptote    = "Sloping asymptote")
+)
+diag_time$time
+diag_time$acf
+```
+
+The **horizontal-asymptote model was kept**. It has one fewer parameter, its
+parameters are better identified, and its residuals showed no time pattern that
+the slope term was needed to remove. Approximate (Wald) intervals:
+
+```{r}
+#| label: time-ci
+summary(fit_time)$coefficients |> knitr::kable(digits = 4)
+confint.default(fit_time) |> knitr::kable(digits = 4)
+```
+
+::: {.callout-tip}
+For `nls` fits, `confint()` uses profile likelihood. Profiling can fail when a
+parameter, especially the rate, is weakly constrained. `confint.default()`
+gives normal-approximation (Wald) intervals instead. These are approximate and
+can be poor for parameters bounded at zero.
+:::
+
+# Accounting for pace variation
+
+Pace was held as steady as possible, but it still varied between segments on
+the track. Faster segments are expected to raise HR. Speed in m/s is used
+rather than pace, so a positive coefficient means *faster → higher HR*. Speed
+is centred on its mean.
+
+```{r}
+#| label: speed-explore
+dat$v0 <- dat$speed - mean(dat$speed)
+dat$hr_resid_time <- dat$y - as.numeric(predict(fit_time, newdata = dat))
+
+speed_cor <- cor.test(dat$speed, dat$hr_resid_time)
+speed_cor
+```
+
+```{r}
+#| label: fig-speed
+#| fig-cap: "HR residuals from the time-only model against segment speed (exploratory)."
+ggplot(dat, aes(speed, hr_resid_time)) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+    geom_smooth(method = "lm", formula = y ~ x, colour = "firebrick", fill = "grey85") +
+    geom_point(size = 2.5) +
+    labs(x = "Mean segment speed (m/s)",
+         y = "HR residual from time-only model (bpm)")
+```
+
+This plot is only exploratory. The adjusted speed effect comes from fitting
+time and speed **together**, not from regressing the residuals on speed:
+
+```{r}
+#| label: time-speed
+fit_time_speed <- nlsLM(
+    y ~ start_hr + (final_hr - start_hr) * (1 - exp(-growth_rate * x)) +
+        beta_current * v0,
+    data    = dat,
+    start   = c(as.list(coef(fit_time)), list(beta_current = 0)),
+    lower   = c(-Inf, -Inf, 1e-8, -Inf),
+    control = nls.lm.control(maxiter = 1000)
+)
+
+compare_models(list(time_only = fit_time, time_speed = fit_time_speed), dat) |>
+    knitr::kable(digits = 3, row.names = FALSE)
+
+# HR difference associated with a 0.1 m/s faster segment
+0.1 * c(estimate = unname(coef(fit_time_speed)["beta_current"]),
+        confint.default(fit_time_speed, parm = "beta_current")[1, ])
+```
+
+# Carryover from the preceding segment
+
+Segments last one minute, and HR takes time to respond to changes in workload.
+The HR in one window may therefore still reflect the segment before it. Two
+ways of representing that carryover were compared.
+
+* **Previous speed.** Workload carryover:
+  \[
+  HR_i = f(x_i) + \beta_0 v_i + \beta_1 v_{i-1} + \varepsilon_i
+  \]
+* **Previous HR.** State carryover. The previous segment's deviation from the
+  time trend persists with factor $\phi \in [0, 0.999]$:
+  \[
+  HR_i = f(x_i) + \phi\left[HR_{i-1} - f(x_{i-1})\right] + \beta_0 v_i + \varepsilon_i
+  \]
+
+Here $f(x)$ is the horizontal-asymptote trend, and its parameters are estimated
+jointly with the other terms. Segment 1 has no predecessor, so **all models
+from here on are fitted to segments 2–26**. That way they share the same
+observations and their AICc values can be compared. Time `x` keeps its
+original origin.
+
+```{r}
+#| label: lagged-data
+speed_reference <- mean(dat$speed)
+
+dat <- dat |>
+    mutate(
+        v0          = speed - speed_reference,
+        v1          = lag(speed) - speed_reference,
+        previous_hr = lag(y),
+        previous_x  = lag(x)
+    )
+
+dd <- dat[-1, ]
+stopifnot(nrow(dd) == 25, all(complete.cases(dd[, c("v0", "v1", "previous_hr")])))
+
+cor(dd$v0, dd$v1)
+```
+
+## Explicit model formulas
+
+Each formula is assembled from named pieces, so every model is easy to read.
+Each model also has its own starting values and bounds, matched one-to-one to
+its parameters by name.
+
+```{r}
+#| label: formulas
+trend      <- "start_hr + (final_hr - start_hr) * (1 - exp(-growth_rate * x))"
+trend_prev <- "start_hr + (final_hr - start_hr) * (1 - exp(-growth_rate * previous_x))"
+
+carry_terms <- c(
+    current_speed  = "",
+    previous_speed = " + beta_previous * v1",
+    previous_hr    = paste0(" + phi * (previous_hr - (", trend_prev, "))")
+)
+
+cadence_terms <- c(
+    none      = "",
+    linear    = " + beta_cadence * cadence_10",
+    quadratic = " + beta_cadence * cadence_10 + beta_cadence2 * I(cadence_10^2)"
+)
+
+build_formula <- function(carry, cadence) {
+    as.formula(paste0(
+        "y ~ ", trend, " + beta_current * v0",
+        carry_terms[[carry]], cadence_terms[[cadence]]
+    ))
+}
+
+# Fit with bounds built by parameter name, in the same order as `start`.
+fit_hr <- function(carry, cadence, start, data = dd) {
+    start <- unlist(start)
+    lower <- setNames(rep(-Inf, length(start)), names(start))
+    upper <- setNames(rep( Inf, length(start)), names(start))
+    lower["growth_rate"] <- 1e-8
+    if ("phi" %in% names(start)) {
+        lower["phi"] <- 0
+        upper["phi"] <- 0.999
+    }
+    nlsLM(
+        build_formula(carry, cadence),
+        data    = data,
+        start   = as.list(start),
+        lower   = unname(lower),
+        upper   = unname(upper),
+        control = nls.lm.control(maxiter = 1000)
+    )
+}
+
+build_formula("previous_hr", "quadratic")
+```
+
+## Baseline models (no cadence term)
+
+```{r}
+#| label: baselines
+p_ts <- coef(fit_time_speed)
+
+baseline <- list()
+baseline$current_speed  <- fit_hr("current_speed", "none", p_ts)
+baseline$previous_speed <- fit_hr("previous_speed", "none",
+                                  c(coef(baseline$current_speed), beta_previous = 0))
+baseline$previous_hr    <- fit_hr("previous_hr", "none",
+                                  c(coef(baseline$current_speed), phi = 0.3))
+
+compare_models(baseline, dd) |> knitr::kable(digits = 3, row.names = FALSE)
+```
+
+```{r}
+#| label: carry-coefs
+rbind(
+    previous_speed = c(estimate = unname(coef(baseline$previous_speed)["beta_previous"]),
+                       confint.default(baseline$previous_speed, parm = "beta_previous")[1, ]),
+    previous_hr    = c(estimate = unname(coef(baseline$previous_hr)["phi"]),
+                       confint.default(baseline$previous_hr, parm = "phi")[1, ])
+) |> knitr::kable(digits = 3)
+```
+
+```{r}
+#| label: fig-baseline-residuals
+#| fig-cap: "Residual diagnostics for the three baseline models (segments 2–26)."
+#| fig-height: 7
+diag_base <- plot_residual_diagnostics(baseline, dd, labels = model_labels)
+diag_base$time
+diag_base$acf
+```
+
+Both carryover terms improved on current speed alone. **Previous speed** has a
+positive coefficient: a faster preceding segment goes with a higher HR now, at
+the same current speed and time. **Previous HR** captures the combined
+carryover of earlier speed, cadence and anything else.
+
+The two models answer slightly different questions. Neither is assumed to be
+the right one. All three are carried forward as a sensitivity analysis.
+
+# Cadence
+
+## Model specification
+
+The same cadence term is added to each of the three baselines. Cadence is
+centred on its mean and expressed per 10 steps/min:
+\[
+g(c) = \gamma_1 z + \gamma_2 z^2, \qquad z = \frac{c - c_0}{10}.
+\]
+Curvature $\gamma_2$ is left unconstrained, so a U-shape is not forced. If
+$\gamma_2 > 0$, HR is lowest at
+\[
+c^* = c_0 - 10\,\frac{\gamma_1}{2\gamma_2}.
+\]
+Each linear model starts from its fitted baseline, and each quadratic model
+starts from its fitted linear model.
+
+```{r}
+#| label: cadence-models
+cadence_reference <- mean(dd$cadence)
+dd$cadence_10     <- (dd$cadence - cadence_reference) / 10
+observed_range    <- range(dd$cadence)
+
+carry_names <- names(carry_terms)
+
+fits_linear <- setNames(lapply(carry_names, function(k) {
+    fit_hr(k, "linear", c(coef(baseline[[k]]), beta_cadence = 0.1))
+}), carry_names)
+
+fits_quadratic <- setNames(lapply(carry_names, function(k) {
+    fit_hr(k, "quadratic", c(coef(fits_linear[[k]]), beta_cadence2 = 0))
+}), carry_names)
+```
+
+## Model comparison
+
+```{r}
+#| label: cadence-comparison
+all_fits <- c(
+    setNames(baseline,       paste0(carry_names, " / no cadence")),
+    setNames(fits_linear,    paste0(carry_names, " / linear")),
+    setNames(fits_quadratic, paste0(carry_names, " / quadratic"))
+)
+
+compare_models(all_fits, dd) |> knitr::kable(digits = 3, row.names = FALSE)
+```
+
+Look at the comparison within each carryover family as well as overall. Does
+the quadratic term clearly beat both the no-cadence and linear versions?
+
+## Estimated HR-minimising cadence
+
+The uncertainty of $c^*$ comes from the delta method, using the covariance of
+$(\gamma_1, \gamma_2)$. Leave-one-out refits show how much the estimate moves
+when any single segment is dropped.
+
+```{r}
+#| label: minima
+cadence_minimum <- function(p) {
+    if (p["beta_cadence2"] <= 0) return(NA_real_)
+    unname(cadence_reference - 10 * p["beta_cadence"] / (2 * p["beta_cadence2"]))
+}
+
+minimum_se <- function(model) {
+    p <- coef(model)
+    if (p["beta_cadence2"] <= 0) return(NA_real_)
+    g <- c(-5 / p["beta_cadence2"],
+           5 * p["beta_cadence"] / p["beta_cadence2"]^2)
+    V <- vcov(model)[c("beta_cadence", "beta_cadence2"),
+                     c("beta_cadence", "beta_cadence2")]
+    sqrt(as.numeric(t(g) %*% V %*% g))
+}
+
+loo_minima <- function(k) {
+    vapply(seq_len(nrow(dd)), function(i) {
+        fit <- tryCatch(
+            fit_hr(k, "quadratic", coef(fits_quadratic[[k]]), data = dd[-i, ]),
+            error = function(e) NULL
+        )
+        if (is.null(fit)) NA_real_ else cadence_minimum(coef(fit))
+    }, numeric(1))
+}
+
+minima <- do.call(rbind, lapply(carry_names, function(k) {
+    m   <- fits_quadratic[[k]]
+    p   <- coef(m)
+    est <- cadence_minimum(p)
+    se  <- minimum_se(m)
+    loo <- loo_minima(k)
+    data.frame(
+        model            = model_labels[[k]],
+        curvature_per_10 = unname(p["beta_cadence2"]),
+        curvature_lo     = confint.default(m, parm = "beta_cadence2")[1],
+        curvature_hi     = confint.default(m, parm = "beta_cadence2")[2],
+        minimum_spm      = est,
+        wald_lo          = est - 1.96 * se,
+        wald_hi          = est + 1.96 * se,
+        within_range     = is.finite(est) && est >= observed_range[1] && est <= observed_range[2],
+        loo_min          = suppressWarnings(min(loo, na.rm = TRUE)),
+        loo_max          = suppressWarnings(max(loo, na.rm = TRUE)),
+        loo_failed       = sum(is.na(loo))
+    )
+}))
+
+minima |> knitr::kable(digits = 2, row.names = FALSE)
+```
+
+`curvature_per_10` is the quadratic coefficient, in bpm per (10 steps/min)².
+Its interval shows whether the U-shape is supported at all. A minimum computed
+from an almost flat curve is not meaningful, however precise the number looks.
+The Wald interval for $c^*$ is a rough guide. A ratio of coefficients can have
+a strongly asymmetric sampling distribution.
+
+## Cadence curves with adjusted observations
+
+For each model, the plotted points are
+\[
+\text{adjusted HR}_i = \text{residual}_i + \hat g(c_i).
+\]
+This is the observed HR minus the model's fitted time, speed and carryover
+contributions. Zero is the model's non-cadence prediction at the reference
+cadence $c_0$. The ribbon is a pointwise 95% Wald band for $\hat g(c)$
+relative to $c_0$, so it narrows to zero at $c_0$ by construction.
+
+The three models adjust for different things, so each has its own set of
+points.
+
+```{r}
+#| label: fig-cadence-curves
+#| fig-cap: "Fitted cadence contribution (line, 95% band) and model-adjusted segment HR (points) for each carryover specification. Dashed lines mark the estimated minima."
+#| fig-height: 5.5
+cadence_grid <- seq(observed_range[1], observed_range[2], length.out = 300)
+z_grid       <- (cadence_grid - cadence_reference) / 10
+
+curve_df <- bind_rows(lapply(carry_names, function(k) {
+    m <- fits_quadratic[[k]]
+    p <- coef(m)
+    V <- vcov(m)[c("beta_cadence", "beta_cadence2"), c("beta_cadence", "beta_cadence2")]
+    X <- cbind(z_grid, z_grid^2)
+    data.frame(
+        model   = k,
+        cadence = cadence_grid,
+        fit     = as.numeric(X %*% p[c("beta_cadence", "beta_cadence2")]),
+        se      = sqrt(rowSums((X %*% V) * X))
+    )
+}))
+
+point_df <- bind_rows(lapply(carry_names, function(k) {
+    m <- fits_quadratic[[k]]
+    p <- coef(m)
+    g <- p["beta_cadence"] * dd$cadence_10 + p["beta_cadence2"] * dd$cadence_10^2
+    data.frame(
+        model       = k,
+        cadence     = dd$cadence,
+        adjusted_hr = dd$y - as.numeric(predict(m, newdata = dd)) + g
+    )
+}))
+
+minima_df <- data.frame(model = carry_names,
+                        minimum = minima$minimum_spm) |>
+    filter(is.finite(minimum),
+           minimum >= observed_range[1], minimum <= observed_range[2])
+
+curve_df$model  <- factor(curve_df$model,  levels = carry_names)
+point_df$model  <- factor(point_df$model,  levels = carry_names)
+minima_df$model <- factor(minima_df$model, levels = carry_names)
+
+facet_labeller <- as_labeller(model_labels)
+
+ggplot(curve_df, aes(cadence, fit, colour = model, fill = model)) +
+    geom_hline(yintercept = 0, linetype = 3, colour = "grey60") +
+    geom_ribbon(aes(ymin = fit - 1.96 * se, ymax = fit + 1.96 * se),
+                alpha = 0.15, colour = NA) +
+    geom_point(data = point_df, aes(y = adjusted_hr), size = 2.2, alpha = 0.75) +
+    geom_line(linewidth = 1.1) +
+    geom_vline(data = minima_df, aes(xintercept = minimum, colour = model),
+               linetype = 2) +
+    facet_wrap(~ model, nrow = 1, labeller = facet_labeller) +
+    scale_colour_manual(values = model_colours, guide = "none") +
+    scale_fill_manual(values = model_colours, guide = "none") +
+    labs(x = params$cadence_label,
+         y = "Adjusted HR relative to reference cadence (bpm)")
+```
+
+```{r}
+#| label: fig-cadence-overlay
+#| fig-cap: "Fitted cadence curves from the three carryover specifications on a common scale."
+ggplot(curve_df, aes(cadence, fit, colour = model)) +
+    geom_hline(yintercept = 0, linetype = 3, colour = "grey60") +
+    geom_line(linewidth = 1.1) +
+    geom_vline(data = minima_df, aes(xintercept = minimum, colour = model),
+               linetype = 2) +
+    scale_colour_manual(values = model_colours, labels = model_labels) +
+    labs(x = params$cadence_label,
+         y = "Conditional HR difference from reference (bpm)",
+         colour = NULL) +
+    theme(legend.position = "bottom")
+```
+
+## Residual checks for the cadence models
+
+```{r}
+#| label: fig-cadence-residuals
+#| fig-cap: "Residual diagnostics for the three quadratic-cadence models."
+#| fig-height: 7
+diag_cad <- plot_residual_diagnostics(fits_quadratic, dd, labels = model_labels)
+diag_cad$time
+diag_cad$acf
+```
+
+```{r}
+#| label: quadratic-coefs
+#| results: asis
+for (k in carry_names) {
+    cat("\n\n**", model_labels[[k]], "**\n\n", sep = "")
+    print(knitr::kable(summary(fits_quadratic[[k]])$coefficients, digits = 4))
+}
+```
+
+# Summary
+
+```{r}
+#| label: summary-values
+#| include: false
+fmt_min <- function(k) {
+    r <- minima[minima$model == model_labels[[k]], ]
+    if (!is.finite(r$minimum_spm)) return("no interior minimum (curve not convex)")
+    sprintf("%.1f steps/min (approx. 95%% CI %.1f to %.1f)",
+            r$minimum_spm, r$wald_lo, r$wald_hi)
+}
+```
+
+Estimated HR-minimising cadence at about 3:55 min/km, by carryover
+specification:
+
+* **Current speed:** `r fmt_min("current_speed")`
+* **Current + previous speed:** `r fmt_min("previous_speed")`
+* **Current speed + previous HR:** `r fmt_min("previous_hr")`
+
+How to read these results:
+
+1. **Agreement across models.** If all three give an interior minimum in a
+   similar place, the result does not depend much on how carryover is
+   modelled. That is reassuring, but it is not proof.
+2. **Effect size.** Use the curves to see how many bpm separate the minimum
+   from the edges of the tested range. In one outdoor study of recreational
+   runners, switching from preferred to optimal cadence predicted a median HR
+   reduction of only about 0.5 bpm. A shallow curve can produce a well-defined
+   but practically unimportant minimum.
+3. **What "efficient" means here.** HR stands in for metabolic cost. It is
+   affected by cardiac drift, temperature and hydration, which the time trend
+   only partly captures. The cadence term in the previous-HR model is also
+   conditional on the HR state carried in from the segment before. It is a
+   short-run effect at the segment level, not the steady-state difference from
+   holding one cadence for longer.
+4. **Design limits.** This is one session of 25 usable one-minute segments,
+   run on a track at prescribed (not measured) cadence, with 35-second windows
+   that may not reach full HR equilibrium. A repeat session with a new random
+   order, ideally on a treadmill or with longer segments, would be the most
+   informative next step.
+
+# Session info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
